@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Harwayne/github-reviews/pkg/ratelimiter"
+
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 )
@@ -19,18 +21,13 @@ const (
 )
 
 var (
-	tokenFile = flag.String("token_file", "", "Path to the token file")
-	owner     = flag.String("owner", "knative", "GitHub repo owner's name (either org or user)")
-	start     = flag.String("start", time.Now().Format(timeFormat), "Start date in '%m-%d-%y' format")
-	end       = flag.String("end", time.Now().Format(timeFormat), "End date in %m-%d-%y format")
-	workers = flag.Int("workers", 1, "Number of parallel workers. If using more than one, you might hit the GitHub API rate limits and get throttled or temporarily banned.")
-	repos     stringSlice
-	users     stringSlice
-
-	// The API limit seems to be 5000 requests per hour. So keep after every API request sleep
-	// for 0.75 seconds, which should limit the number of requests to 4800 requests per hour.
-	sleep           = 750 * time.Millisecond
-	parallelWorkers = 1
+	tokenFile  = flag.String("token_file", "", "Path to the token file")
+	owner      = flag.String("owner", "knative", "GitHub repo owner's name (either org or user)")
+	start      = flag.String("start", time.Now().Format(timeFormat), "Start date in '%m-%d-%y' format")
+	end        = flag.String("end", time.Now().Format(timeFormat), "End date in %m-%d-%y format")
+	maxWorkers = flag.Int("max_workers", 16, "Number of parallel workers. If using more than one, you might hit the GitHub API rate limits and get throttled or temporarily banned.")
+	repos      stringSlice
+	users      stringSlice
 
 	retryCount = 5
 )
@@ -46,12 +43,16 @@ func (ss *stringSlice) Set(v string) error {
 	return nil
 }
 
+var (
+	rl *ratelimiter.RateLimiter
+)
+
 func main() {
 	flag.Var(&repos, "repos", "Repo name")
 	flag.Var(&users, "users", "Github users")
 	flag.Parse()
 
-	parallelWorkers = *workers
+	rl = ratelimiter.New(*maxWorkers)
 
 	startTime, err := time.Parse(timeFormat, *start)
 	if err != nil {
@@ -112,7 +113,7 @@ func readOauthToken() string {
 }
 
 func listPRs(client *github.Client, startTime time.Time) []*github.PullRequest {
-	prs := make([]*github.PullRequest, 0, 10_000)
+	prs := make([]*github.PullRequest, 0, 10000)
 	for _, repo := range repos {
 		page := 0
 		for {
@@ -145,14 +146,26 @@ func listPRs(client *github.Client, startTime time.Time) []*github.PullRequest {
 }
 
 func retryListUpTo(count int, f func() ([]*github.PullRequest, *github.Response, error)) ([]*github.PullRequest, *github.Response, error) {
+	type pullRequestOutput struct {
+		p   []*github.PullRequest
+		r   *github.Response
+		err error
+	}
+	wrappedF := func() (interface{}, *github.Response) {
+		p, r, err := f()
+		return pullRequestOutput{
+			p:   p,
+			r:   r,
+			err: err,
+		}, r
+	}
 	i := 1
 	for {
-		p, r, err := f()
-		time.Sleep(sleep)
-		if err == nil {
-			return p, r, nil
+		o := rl.DoWork(wrappedF).(pullRequestOutput)
+		if o.err == nil {
+			return o.p, o.r, nil
 		} else if i > count {
-			return p, r, err
+			return o.p, o.r, o.err
 		}
 		i++
 	}
@@ -193,7 +206,8 @@ func contains(set []string, s string) bool {
 func filterPRsForTouch(client *github.Client, unfiltered []*github.PullRequest, users []string) []*github.PullRequest {
 	input := make(chan *github.PullRequest, len(unfiltered))
 	output := make(chan *github.PullRequest, len(unfiltered))
-	for i := 0; i < parallelWorkers; i++ {
+	// This still has to be in parallel....
+	for i := 0; i < *maxWorkers; i++ {
 		go func() {
 			for {
 				pr := <-input
@@ -219,22 +233,34 @@ func filterPRsForTouch(client *github.Client, unfiltered []*github.PullRequest, 
 }
 
 func prCommentedOnBy(client *github.Client, pr *github.PullRequest, users []string) bool {
+	type listComments struct {
+		comments []*github.IssueComment
+		response *github.Response
+		err      error
+	}
 	page := 0
 	for {
 		c, r, err := retryListCommentsUpTo(retryCount, func() ([]*github.IssueComment, *github.Response, error) {
-			return client.Issues.ListComments(
-				context.TODO(),
-				pr.GetBase().GetRepo().GetOwner().GetLogin(),
-				pr.GetBase().GetRepo().GetName(),
-				pr.GetNumber(),
-				&github.IssueListCommentsOptions{
-					ListOptions: github.ListOptions{
-						Page: page,
-						PerPage: 100,
-					},
-			})
+			lc := rl.DoWork(func() (interface{}, *github.Response) {
+				comments, response, err := client.Issues.ListComments(
+					context.TODO(),
+					pr.GetBase().GetRepo().GetOwner().GetLogin(),
+					pr.GetBase().GetRepo().GetName(),
+					pr.GetNumber(),
+					&github.IssueListCommentsOptions{
+						ListOptions: github.ListOptions{
+							Page:    page,
+							PerPage: 100,
+						},
+					})
+				return listComments{
+					comments: comments,
+					response: response,
+					err:      err,
+				}, response
+			}).(listComments)
+			return lc.comments, lc.response, lc.err
 		})
-		time.Sleep(sleep)
 		if err != nil {
 			log.Fatalf("Unable to get comments on PR %v: %v", pr.GetNumber(), err)
 		}
@@ -254,7 +280,6 @@ func retryListCommentsUpTo(count int, f func() ([]*github.IssueComment, *github.
 	i := 1
 	for {
 		c, r, err := f()
-		time.Sleep(sleep)
 		if err == nil {
 			return c, r, nil
 		} else if i > count {
@@ -265,18 +290,31 @@ func retryListCommentsUpTo(count int, f func() ([]*github.IssueComment, *github.
 }
 
 func prReviewedBy(client *github.Client, pr *github.PullRequest, users []string) bool {
+	type listReviews struct {
+		reviews  []*github.PullRequestReview
+		response *github.Response
+		err      error
+	}
 	page := 0
 	for {
 		c, r, err := retryListReviewsUpTo(retryCount, func() ([]*github.PullRequestReview, *github.Response, error) {
-			return client.PullRequests.ListReviews(
-				context.TODO(),
-				pr.GetBase().GetRepo().GetOwner().GetLogin(),
-				pr.GetBase().GetRepo().GetName(),
-				pr.GetNumber(),
-				&github.ListOptions{
-					Page: page,
-					PerPage: 100,
-				})
+			lr := rl.DoWork(func() (interface{}, *github.Response) {
+				reviews, response, err := client.PullRequests.ListReviews(
+					context.TODO(),
+					pr.GetBase().GetRepo().GetOwner().GetLogin(),
+					pr.GetBase().GetRepo().GetName(),
+					pr.GetNumber(),
+					&github.ListOptions{
+						Page:    page,
+						PerPage: 100,
+					})
+				return listReviews{
+					reviews:  reviews,
+					response: response,
+					err:      err,
+				}, response
+			}).(listReviews)
+			return lr.reviews, lr.response, lr.err
 		})
 		if err != nil {
 			log.Fatalf("Unable to get reviews on PR %v: %v", pr.GetNumber(), err)
@@ -297,7 +335,6 @@ func retryListReviewsUpTo(count int, f func() ([]*github.PullRequestReview, *git
 	i := 1
 	for {
 		c, r, err := f()
-		time.Sleep(sleep)
 		if err == nil {
 			return c, r, nil
 		} else if i > count {
@@ -316,7 +353,7 @@ type lineCounter struct {
 func (lc *lineCounter) added(prs []*github.PullRequest) int64 {
 	input := make(chan *github.PullRequest, len(prs))
 	output := make(chan int64, len(prs))
-	for i := 0; i < parallelWorkers; i++ {
+	for i := 0; i < *maxWorkers; i++ {
 		go func() {
 			for {
 				pr := <-input
@@ -346,20 +383,32 @@ func (lc *lineCounter) countNonVendorLines(pr *github.PullRequest) int64 {
 	if count != -1 {
 		return count
 	}
+	type listFiles struct {
+		files    []*github.CommitFile
+		response *github.Response
+		err      error
+	}
 	count = 0
 	page := 0
 	for {
 		f, r, err := retryListFilesUpTo(retryCount, func() ([]*github.CommitFile, *github.Response, error) {
-
-			return lc.client.PullRequests.ListFiles(
-				context.TODO(),
-				pr.GetBase().GetRepo().GetOwner().GetLogin(),
-				pr.GetBase().GetRepo().GetName(),
-				pr.GetNumber(),
-				&github.ListOptions{
-					Page: page,
-					PerPage: 100,
-				})
+			lf := rl.DoWork(func() (interface{}, *github.Response) {
+				f, r, err := lc.client.PullRequests.ListFiles(
+					context.TODO(),
+					pr.GetBase().GetRepo().GetOwner().GetLogin(),
+					pr.GetBase().GetRepo().GetName(),
+					pr.GetNumber(),
+					&github.ListOptions{
+						Page:    page,
+						PerPage: 100,
+					})
+				return listFiles{
+					files:    f,
+					response: r,
+					err:      err,
+				}, r
+			}).(listFiles)
+			return lf.files, lf.response, lf.err
 		})
 
 		if err != nil {
@@ -385,7 +434,6 @@ func retryListFilesUpTo(count int, f func() ([]*github.CommitFile, *github.Respo
 	i := 1
 	for {
 		c, r, err := f()
-		time.Sleep(sleep)
 		if err == nil {
 			return c, r, nil
 		} else if i > count {
